@@ -92,6 +92,8 @@ use std::mem;
 use indexmap::{IndexMap, IndexSet};
 use toasty_core::stmt::{self, Condition, visit_mut};
 
+use toasty_core::driver::operation::Pagination;
+
 use crate::{
     Result,
     engine::{
@@ -129,13 +131,6 @@ struct ReturningInfo {
 struct PaginationInfo {
     page_size: i64,
     cursor_column_indices: Vec<usize>,
-}
-
-/// Extracted pagination parameters for NoSQL `QueryPk` operations.
-struct QueryPkPagination {
-    limit: Option<i64>,
-    order: Option<stmt::Direction>,
-    cursor: Option<stmt::Value>,
 }
 
 struct PlanStatement<'a, 'b> {
@@ -201,7 +196,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             && let stmt::Statement::Query(query) = &mut stmt
             && let stmt::ExprSet::Values(values) = &mut query.body
         {
-            returning = Some(stmt::Returning::Value(if query.single {
+            returning = Some(stmt::Returning::Expr(if query.single {
                 assert_eq!(1, values.rows.len());
                 values.rows.drain(..).next().unwrap()
             } else {
@@ -281,9 +276,9 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
     ) -> IndexSet<mir::NodeId> {
         let mut inputs = IndexSet::new();
 
-        let is_returning_projection = matches!(returning, Some(stmt::Returning::Expr(..)));
+        let is_returning_projection = matches!(returning, Some(stmt::Returning::Project(..)));
         debug_assert!(
-            is_returning_projection || matches!(returning, None | Some(stmt::Returning::Value(..)))
+            is_returning_projection || matches!(returning, None | Some(stmt::Returning::Expr(..)))
         );
 
         visit_mut::for_each_expr_mut(returning, |expr| {
@@ -586,7 +581,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         assert!(tables.len() <= 1, "TODO: handle more complicated cases");
 
         let sub_query = stmt::Select {
-            returning: stmt::Returning::Expr(stmt::Expr::record([1])),
+            returning: stmt::Returning::Project(stmt::Expr::record([1])),
             source: stmt::Source::Table(stmt::SourceTable {
                 tables,
                 from: vec![stmt::TableWithJoins {
@@ -719,7 +714,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             );
             Ok(node_id)
         } else if self.planner.engine.capability().sql || stmt.is_insert() {
-            Ok(self.plan_data_loading_sql(stmt))
+            self.plan_data_loading_sql(stmt)
         } else {
             self.plan_data_loading_nosql(stmt)
         }
@@ -764,23 +759,20 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
 
     // ===== SQL execution =====
 
-    fn plan_data_loading_sql(&mut self, mut stmt: stmt::Statement) -> mir::NodeId {
+    fn plan_data_loading_sql(&mut self, mut stmt: stmt::Statement) -> Result<mir::NodeId> {
         let const_returning = self.extract_insert_returning_as_const(&stmt);
 
         // Phase 1: Detect pagination and add ORDER BY columns to load_data
-        let pagination_info = self.plan_pagination_sql(&stmt);
+        let pagination_info = self.plan_pagination_sql(&stmt)?;
 
         // Set returning clause with all columns (including added ORDER BY columns)
         if !self.load_data.select_items.is_empty() {
-            stmt.set_returning(
-                stmt::Expr::record(
-                    self.load_data
-                        .select_items
-                        .iter()
-                        .map(|item| item.to_expr()),
-                )
-                .into(),
-            );
+            stmt.set_returning_project(stmt::Expr::record(
+                self.load_data
+                    .select_items
+                    .iter()
+                    .map(|item| item.to_expr()),
+            ));
         }
 
         let input_args: Vec<_> = self
@@ -815,7 +807,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         } else {
             debug_assert!(
                 stmt.returning()
-                    .and_then(|returning| returning.as_expr())
+                    .and_then(|returning| returning.as_project())
                     .map(|expr| expr.is_record())
                     .unwrap_or(true),
                 "stmt={stmt:#?}"
@@ -845,7 +837,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             );
         }
 
-        exec_statement_node
+        Ok(exec_statement_node)
     }
 
     fn extract_insert_returning_as_const(
@@ -908,23 +900,31 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         Some((stmt::Value::List(result), ty))
     }
 
-    fn plan_pagination_sql(&mut self, stmt: &stmt::Statement) -> Option<PaginationInfo> {
+    fn plan_pagination_sql(&mut self, stmt: &stmt::Statement) -> Result<Option<PaginationInfo>> {
         let stmt::Statement::Query(query) = stmt else {
-            return None;
+            return Ok(None);
         };
 
         // Only cursor-based limits trigger pagination planning
-        let stmt::Limit::Cursor(cursor) = query.limit.as_ref()? else {
-            return None;
+        let Some(limit) = query.limit.as_ref() else {
+            return Ok(None);
         };
+        let stmt::Limit::Cursor(cursor) = limit else {
+            return Ok(None);
+        };
+
+        // SQL cursor pagination requires ORDER BY to produce a deterministic cursor.
+        let order_by = query.order_by.as_ref().ok_or_else(|| {
+            toasty_core::Error::unsupported_feature(
+                "cursor-based pagination requires an ORDER BY clause on SQL drivers",
+            )
+        })?;
 
         // Extract page_size
         let page_size = match &cursor.page_size {
             stmt::Expr::Value(stmt::Value::I64(n)) => *n,
-            _ => return None,
+            _ => return Ok(None),
         };
-
-        let order_by = query.order_by.as_ref()?;
 
         // Add ORDER BY columns to load_data so they're available for cursor extraction
         let mut cursor_column_indices = Vec::new();
@@ -940,14 +940,14 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                 cursor_column_indices.push(index);
             } else {
                 // Complex expression in ORDER BY - can't handle yet
-                return None;
+                return Ok(None);
             }
         }
 
-        Some(PaginationInfo {
+        Ok(Some(PaginationInfo {
             page_size,
             cursor_column_indices,
-        })
+        }))
     }
 
     /// Builds extract_cursor function using the inferred row type.
@@ -1003,19 +1003,19 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         ctes.push(stmt::Cte {
             query: stmt::Query::builder(target)
                 .filter(filter.clone())
-                .returning(vec![
+                .returning_project(stmt::Expr::record_from_vec(vec![
                     stmt::Expr::count_star(),
                     stmt::FuncCount {
                         arg: None,
                         filter: Some(Box::new(condition)),
                     }
                     .into(),
-                ])
+                ]))
                 .build(),
         });
 
         let returning_len = match &stmt.returning {
-            Some(stmt::Returning::Expr(expr)) => {
+            Some(stmt::Returning::Project(expr)) => {
                 let stmt::Expr::Record(expr_record) = expr else {
                     panic!("returning must be a record");
                 };
@@ -1041,7 +1041,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                         }
                         .into(),
                         filter: true.into(),
-                        returning: stmt::Returning::Expr(stmt::Expr::record_from_vec(vec![
+                        returning: stmt::Returning::Project(stmt::Expr::record_from_vec(vec![
                             stmt::Expr::eq(
                                 stmt::ExprColumn {
                                     nesting: 0,
@@ -1062,7 +1062,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                     stmt.returning
                         // TODO: hax
                         .unwrap_or_else(|| {
-                            stmt::Returning::Expr(stmt::Expr::record_from_vec(vec![
+                            stmt::Returning::Project(stmt::Expr::record_from_vec(vec![
                                 stmt::Expr::from("hello"),
                             ]))
                         }),
@@ -1112,7 +1112,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                 },
             ),
             filter: stmt::Filter::new(true),
-            returning: stmt::Returning::Expr(stmt::Expr::record_from_vec(columns)),
+            returning: stmt::Returning::Project(stmt::Expr::record_from_vec(columns)),
         })
         .with(ctes)
         .build()
@@ -1152,14 +1152,14 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
 
         let read = stmt::Query::builder(target)
             .filter(filter.clone())
-            .returning(vec![
+            .returning_project(stmt::Expr::record_from_vec(vec![
                 stmt::Expr::count_star(),
                 stmt::FuncCount {
                     arg: None,
                     filter: Some(Box::new(condition)),
                 }
                 .into(),
-            ])
+            ]))
             .locks(if self.planner.engine.capability().select_for_update {
                 vec![stmt::Lock::Update]
             } else {
@@ -1192,12 +1192,32 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
 
         // Without SQL capability, we have to plan the execution of the
         // statement based on available indices.
-        let mut index_plan = self.planner.engine.plan_index_path(&stmt)?;
-        let post_filter = self.prepare_post_filter(&stmt, &mut index_plan);
+        let index_plan_opt = self.planner.engine.plan_index_path(&stmt)?;
 
-        // Type of the final record.
-        // TODO: Clean this up
-        let ty = if self.load_data.select_items.is_empty() {
+        if let Some(mut index_plan) = index_plan_opt {
+            // prepare_post_filter may insert additional columns (e.g. deferred
+            // fields used only in a post-filter) into select_items, so the
+            // record type must be computed AFTER this call.
+            let post_filter = self.prepare_post_filter(&stmt, &mut index_plan);
+
+            let ty = self.infer_nosql_record_ty(&stmt);
+
+            let node_id = if index_plan.index.primary_key {
+                self.plan_primary_key_execution(stmt, &mut index_plan, &ty)
+            } else {
+                self.plan_secondary_index_execution(stmt, &mut index_plan, &ty)
+            };
+
+            Ok(self.apply_post_filter(node_id, post_filter, ty))
+        } else {
+            // No index covers the filter — emit a full-table scan.
+            let ty = self.infer_nosql_record_ty(&stmt);
+            self.plan_scan_execution(stmt, ty)
+        }
+    }
+
+    fn infer_nosql_record_ty(&self, stmt: &stmt::Statement) -> stmt::Type {
+        if self.load_data.select_items.is_empty() {
             if stmt.is_query() {
                 // Query with no columns selected is an existence check: return
                 // an empty record for every matching row.
@@ -1208,16 +1228,59 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         } else {
             self.load_data
                 .select_items
-                .infer_record_list_ty(&self.planner.engine.expr_cx_for(&stmt))
-        };
+                .infer_record_list_ty(&self.planner.engine.expr_cx_for(stmt))
+        }
+    }
 
-        let node_id = if index_plan.index.primary_key {
-            self.plan_primary_key_execution(stmt, &mut index_plan, &ty)
+    fn plan_scan_execution(
+        &mut self,
+        stmt: stmt::Statement,
+        ty: stmt::Type,
+    ) -> Result<mir::NodeId> {
+        let input = if self.load_data.inputs.is_empty() {
+            None
+        } else if self.load_data.inputs.len() == 1 {
+            Some(self.load_data.inputs[0])
         } else {
-            self.plan_secondary_index_execution(stmt, &mut index_plan, &ty)
+            todo!("scan with multiple inputs")
         };
 
-        Ok(self.apply_post_filter(node_id, post_filter, ty))
+        let cx = stmt::ExprContext::new(&*self.planner.engine.schema);
+        let cx = cx.scope(&stmt);
+        let stmt::ExprTarget::Table(table) = cx.target() else {
+            return Err(toasty_core::Error::unsupported_feature(
+                "scan: expected table target",
+            ));
+        };
+        let table_id = table.id;
+
+        // Reject ORDER BY on drivers whose scan operation returns items in an
+        // unspecified order (e.g. DynamoDB Scan has no server-side sort).
+        if let Some(query) = stmt.as_query()
+            && query.order_by.is_some()
+            && !self.planner.engine.capability().scan_supports_sort
+        {
+            return Err(toasty_core::Error::unsupported_feature(
+                "ORDER BY is not supported on full-table scans for this database. \
+                     Consider adding an index on the sort field or removing the ORDER BY clause.",
+            ));
+        }
+
+        let row_filter = {
+            let f = stmt.filter_expr_unwrap();
+            if f.is_true() { None } else { Some(f.clone()) }
+        };
+
+        let limit = extract_pagination(&stmt);
+
+        Ok(self.insert_mir_with_deps(mir::Scan {
+            input,
+            table: table_id,
+            columns: self.load_data.select_items.extract_expr_references(),
+            row_filter,
+            limit,
+            ty,
+        }))
     }
 
     fn plan_primary_key_execution(
@@ -1244,7 +1307,8 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             };
 
             if stmt.is_query() {
-                let qp = extract_query_pk_pagination(&stmt);
+                let limit = extract_pagination(&stmt);
+                let order = extract_query_pk_order(&stmt);
 
                 // For queries, stream all matching records with the requested columns.
                 self.insert_mir_with_deps(mir::QueryPk {
@@ -1255,9 +1319,8 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                     pk_filter: index_plan.index_filter.take(),
                     row_filter: index_plan.result_filter.take(),
                     ty: ty.clone(),
-                    limit: qp.limit,
-                    order: qp.order,
-                    cursor: qp.cursor,
+                    limit,
+                    order,
                 })
             } else {
                 // For mutations (UPDATE/DELETE) with a partial primary-key filter,
@@ -1287,7 +1350,6 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                     ty: index_key_ty,
                     limit: None,
                     order: None,
-                    cursor: None,
                 });
 
                 self.build_key_operation(&stmt, index_plan, query_pk_node, ty)
@@ -1319,7 +1381,8 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                 Some(inputs[0])
             };
 
-            let qp = extract_query_pk_pagination(&stmt);
+            let limit = extract_pagination(&stmt);
+            let order = extract_query_pk_order(&stmt);
 
             // Use QueryPk with index to query the secondary index and return full records
             // This eliminates the N+1 pattern of FindPkByIndex + GetByKey
@@ -1331,9 +1394,8 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                 pk_filter: index_plan.index_filter.take(),
                 row_filter: index_plan.result_filter.take(),
                 ty: ty.clone(), // Full record type, not just PKs
-                limit: qp.limit,
-                order: qp.order,
-                cursor: qp.cursor,
+                limit,
+                order,
             });
         }
 
@@ -1454,10 +1516,11 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                     ty: ty.clone(),
                 })
             }
-            stmt::Statement::Delete(_) => self.insert_mir_with_deps(mir::DeleteByKey {
+            stmt::Statement::Delete(delete_stmt) => self.insert_mir_with_deps(mir::DeleteByKey {
                 input: get_by_key_input,
                 table: index_plan.table_id(),
                 filter: index_plan.result_filter.take(),
+                condition: delete_stmt.condition.expr.clone(),
                 ty: stmt::Type::Unit,
             }),
             stmt::Statement::Update(update_stmt) => {
@@ -1621,7 +1684,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         // Then handle returning clause
         if let Some(clause) = returning.clause {
             match clause {
-                stmt::Returning::Value(expr) => {
+                stmt::Returning::Expr(expr) => {
                     // Value variant contains a constant expression that can be evaluated
                     if let Ok(value) = expr.eval_const() {
                         let ty = value.infer_ty();
@@ -1645,7 +1708,7 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
                         node_id
                     }
                 }
-                stmt::Returning::Expr(projection) => {
+                stmt::Returning::Project(projection) => {
                     if let Some(position) = returning.inputs.get_index_of(&data_load_node_id) {
                         self.insert_mir_with_deps(mir::Eval {
                             inputs: returning.inputs,
@@ -1727,49 +1790,50 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
     }
 }
 
-/// Extract pagination parameters (limit, sort direction, cursor) from a
-/// query statement for use with `QueryPk` on NoSQL drivers.
-fn extract_query_pk_pagination(stmt: &stmt::Statement) -> QueryPkPagination {
-    let Some(query) = stmt.as_query() else {
-        return QueryPkPagination {
-            limit: None,
-            order: None,
-            cursor: None,
-        };
-    };
-
-    let (limit, cursor) = match query.limit.as_ref() {
-        Some(stmt::Limit::Cursor(c)) => {
-            let page_size = match &c.page_size {
-                stmt::Expr::Value(stmt::Value::I64(n)) => Some(*n),
-                _ => None,
-            };
-            let cursor = c.after.as_ref().and_then(|expr| match expr {
+/// Extract limit/pagination bounds from a query statement for use with
+/// `QueryPk` on NoSQL drivers. Returns `None` when the statement has no limit
+/// clause.
+///
+/// Assumes `page_size`, `limit`, and `offset` fields are `Value::I64` literals.
+/// Builders normalize to `I64`, and `verify::verify_limit_is_integer_literal`
+/// enforces this invariant on the AST — so any other shape reaching here is a
+/// bug upstream.
+fn extract_pagination(stmt: &stmt::Statement) -> Option<Pagination> {
+    let query = stmt.as_query()?;
+    match query.limit.as_ref()? {
+        stmt::Limit::Cursor(c) => {
+            let page_size = as_i64_literal(&c.page_size);
+            let after = c.after.as_ref().and_then(|e| match e {
                 stmt::Expr::Value(v) => Some(v.clone()),
                 _ => None,
             });
-            (page_size, cursor)
+            Some(Pagination::Cursor { page_size, after })
         }
-        Some(stmt::Limit::Offset(lo)) => {
-            let limit = match &lo.limit {
-                stmt::Expr::Value(stmt::Value::I64(n)) => Some(*n),
-                _ => None,
-            };
-            (limit, None)
+        stmt::Limit::Offset(lo) => {
+            let limit = as_i64_literal(&lo.limit);
+            let offset = lo.offset.as_ref().map(as_i64_literal);
+            Some(Pagination::Offset { limit, offset })
         }
-        None => (None, None),
-    };
+    }
+}
 
-    let order = query.order_by.as_ref().and_then(|ob| {
+/// Extracts an `i64` from a `Value::I64` literal expression. Panics on any
+/// other shape — an invariant violation that `verify` should have caught.
+fn as_i64_literal(expr: &stmt::Expr) -> i64 {
+    match expr {
+        stmt::Expr::Value(stmt::Value::I64(n)) => *n,
+        _ => panic!("limit/offset must be an i64 literal; got {expr:#?}"),
+    }
+}
+
+/// Extract the sort direction from a query statement's ORDER BY clause for use
+/// with `QueryPk` on NoSQL drivers.
+fn extract_query_pk_order(stmt: &stmt::Statement) -> Option<stmt::Direction> {
+    let query = stmt.as_query()?;
+    query.order_by.as_ref().and_then(|ob| {
         ob.exprs.first().map(|e| match e.order {
             Some(stmt::Direction::Desc) => stmt::Direction::Desc,
             _ => stmt::Direction::Asc,
         })
-    });
-
-    QueryPkPagination {
-        limit,
-        order,
-        cursor,
-    }
+    })
 }

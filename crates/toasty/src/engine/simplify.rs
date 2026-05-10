@@ -1,33 +1,25 @@
-mod association;
 mod expr_and;
 mod expr_any;
 mod expr_binary_op;
 mod expr_cast;
 mod expr_exists;
-mod expr_in_list;
 mod expr_is_null;
 mod expr_let;
 mod expr_list;
 mod expr_map;
-mod expr_match;
-mod expr_not;
 mod expr_or;
 mod expr_project;
-mod expr_record;
 mod stmt_query;
 
 // Simplifications
 // TODO: unify names
 mod lift_in_subquery;
 use toasty_core::{
-    schema::{
-        app::{Field, FieldId},
-        *,
-    },
+    schema::*,
     stmt::{self, Expr, IntoExprTarget, Node, VisitMut},
 };
 
-use crate::engine::Engine;
+use crate::engine::{Engine, fold};
 
 /// Statement and expression simplifier.
 ///
@@ -56,10 +48,14 @@ pub(crate) fn simplify_expr(cx: stmt::ExprContext<'_>, expr: &mut stmt::Expr) {
 
 impl VisitMut for Simplify<'_> {
     fn visit_expr_mut(&mut self, i: &mut stmt::Expr) {
-        // First, simplify the expression.
+        // Recurse into children first.
         stmt::visit_mut::visit_expr_mut(self, i);
 
-        // If an in-subquery expression, then try lifting it.
+        // Fold this node bottom-up so heavyweight rules see canonical input.
+        // Children are already canonical (post-order recursion), so this is
+        // effectively local.
+        fold::fold_stmt(i);
+
         let maybe_expr = match i {
             Expr::Any(expr) => self.simplify_expr_any(expr),
             Expr::And(expr) => self.simplify_expr_and(expr),
@@ -68,21 +64,21 @@ impl VisitMut for Simplify<'_> {
             }
             Expr::Cast(expr) => self.simplify_expr_cast(expr),
             Expr::Exists(expr) => self.simplify_expr_exists(expr),
-            Expr::InList(expr) => self.simplify_expr_in_list(expr),
             Expr::InSubquery(expr) => self.lift_in_subquery(&expr.expr, &expr.query),
             Expr::Let(expr) => self.simplify_expr_let(expr),
             Expr::List(expr) => self.simplify_expr_list(expr),
             Expr::Map(_) => self.simplify_expr_map(i),
-            Expr::Match(expr) => self.simplify_expr_match(expr),
-            Expr::Not(expr) => self.simplify_expr_not(expr),
             Expr::Or(expr) => self.simplify_expr_or(expr),
-            Expr::Record(expr) => self.simplify_expr_record(expr),
             Expr::IsNull(expr) => self.simplify_expr_is_null(expr),
             Expr::Project(expr) => self.simplify_expr_project(expr),
             _ => None,
         };
 
-        if let Some(expr) = maybe_expr {
+        if let Some(mut expr) = maybe_expr {
+            // Heavyweight rules may emit new fold-eligible structure
+            // (e.g., match elimination produces ANDs containing constants
+            // that need short-circuiting).
+            fold::fold_stmt(&mut expr);
             *i = expr;
         }
     }
@@ -137,11 +133,6 @@ impl VisitMut for Simplify<'_> {
         // Visit and simplify source first before pushing a new scope
         self.visit_source_mut(&mut stmt.from);
 
-        // Convert "via" associations into WHERE filters. For example,
-        // user.todos().delete(...) becomes "DELETE FROM Todo" with via association,
-        // which gets simplified to "DELETE FROM Todo WHERE user_id IN (SELECT id FROM User WHERE ...)"
-        self.simplify_via_association_for_delete(stmt);
-
         let mut s = self.scope(&stmt.from);
 
         s.visit_filter_mut(&mut stmt.filter);
@@ -155,11 +146,6 @@ impl VisitMut for Simplify<'_> {
         // Visit target first before pushing a new scope.
         self.visit_insert_target_mut(&mut stmt.target);
 
-        // Convert "via" associations in insert scopes into WHERE filters. For example,
-        // user.todos().insert(...) creates a scope query that gets simplified to ensure
-        // inserted todos are automatically linked to the specific user.
-        self.simplify_via_association_for_insert(stmt);
-
         // Create a new scope for the insert target
         let mut s = self.scope(&stmt.target);
 
@@ -172,8 +158,6 @@ impl VisitMut for Simplify<'_> {
     }
 
     fn visit_stmt_query_mut(&mut self, stmt: &mut stmt::Query) {
-        self.simplify_via_association_for_query(stmt);
-
         stmt::visit_mut::visit_stmt_query_mut(self, stmt);
 
         self.simplify_stmt_query_when_empty(stmt);
@@ -241,10 +225,6 @@ impl<'a> Simplify<'a> {
 
     fn schema(&self) -> &'a Schema {
         self.cx.schema()
-    }
-
-    fn field(&self, field_id: impl Into<FieldId>) -> &Field {
-        self.cx.schema().app.field(field_id.into())
     }
 
     /// Return a new `Simplify` instance that operates on a nested scope

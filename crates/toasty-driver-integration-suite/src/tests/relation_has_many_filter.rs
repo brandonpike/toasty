@@ -2,7 +2,7 @@
 
 use crate::prelude::*;
 
-#[driver_test(id(ID), requires(sql))]
+#[driver_test(id(ID), requires(scan))]
 pub async fn filter_parent_by_child_field(test: &mut Test) -> Result<()> {
     #[derive(Debug, toasty::Model)]
     struct User {
@@ -98,7 +98,7 @@ pub async fn filter_parent_by_child_field(test: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), requires(sql))]
+#[driver_test(id(ID), requires(scan))]
 pub async fn filter_parent_no_matching_children(test: &mut Test) -> Result<()> {
     #[derive(Debug, toasty::Model)]
     struct User {
@@ -145,6 +145,49 @@ pub async fn filter_parent_no_matching_children(test: &mut Test) -> Result<()> {
         .await?;
 
     assert!(users.is_empty());
+
+    Ok(())
+}
+
+#[driver_test(
+    id(ID),
+    requires(scan),
+    scenario(crate::scenarios::has_many_belongs_to)
+)]
+pub async fn filter_parent_all_children_match(test: &mut Test) -> Result<()> {
+    let mut db = setup(test).await;
+
+    toasty::create!(User::[
+        { name: "Alice", todos: [{ title: "urgent" }] },
+        { name: "Bob", todos: [{ title: "later" }, { title: "later" }] },
+        { name: "Carol", todos: [{ title: "urgent" }, { title: "later" }] },
+        // Dan has no todos — should match `all(...)` vacuously.
+        { name: "Dan" },
+    ])
+    .exec(&mut db)
+    .await?;
+
+    // All todos "urgent" → Alice (only urgent) and Dan (no todos, vacuous).
+    let users: Vec<_> = User::filter(
+        User::fields()
+            .todos()
+            .all(Todo::fields().title().eq("urgent")),
+    )
+    .exec(&mut db)
+    .await?;
+
+    assert_eq_unordered!(users.iter().map(|u| &u.name[..]), ["Alice", "Dan"]);
+
+    // All todos "later" → Bob and Dan.
+    let users: Vec<_> = User::filter(
+        User::fields()
+            .todos()
+            .all(Todo::fields().title().eq("later")),
+    )
+    .exec(&mut db)
+    .await?;
+
+    assert_eq_unordered!(users.iter().map(|u| &u.name[..]), ["Bob", "Dan"]);
 
     Ok(())
 }

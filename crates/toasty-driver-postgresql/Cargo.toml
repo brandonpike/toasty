@@ -1,6 +1,6 @@
 [package]
 name = "toasty-driver-postgresql"
-version = "0.4.0"
+version = "0.5.0"
 description = "PostgreSQL driver for Toasty"
 authors.workspace = true
 edition.workspace = true
@@ -40,6 +40,7 @@ jiff = { workspace = true, optional = true }
 lru.workspace = true
 tracing.workspace = true
 percent-encoding.workspace = true
+postgres-protocol.workspace = true
 postgres-types.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

@@ -106,9 +106,56 @@ pub struct Capability {
     /// DynamoDB: false. All other backends: true (SQL backends never use index key conditions).
     pub index_or_predicate: bool,
 
+    /// Whether the database has a native prefix-match operator that does not
+    /// require LIKE-style escaping. When `true`, `starts_with` is left in the
+    /// AST and the driver renders it natively (DynamoDB's `begins_with()`,
+    /// PostgreSQL's `^@`). When `false`, the lowering rewrites it to a
+    /// `LIKE` expression — which requires `native_like` to be `true`.
+    pub native_starts_with: bool,
+
+    /// Whether the database has a native `LIKE` expression. When `false`,
+    /// `Expr::Like` cannot be sent to the driver; `starts_with` lowering
+    /// will not produce one.
+    pub native_like: bool,
+
+    /// Whether the driver can answer queries that don't match any primary key
+    /// or index — i.e. supports unindexed full-table reads.
+    ///
+    /// SQL drivers set this to `true`: unindexed queries go through
+    /// [`QuerySql`](super::operation::QuerySql), so the SQL engine handles
+    /// them transparently. DynamoDB also sets this to `true`; the planner
+    /// emits [`Operation::Scan`](super::Operation::Scan) for the unindexed
+    /// case. A hypothetical pure key-value store with no full-scan capability
+    /// would set this to `false`.
+    pub scan: bool,
+
+    /// Whether scan operations support ordering results.
+    ///
+    /// SQL drivers do not use `Operation::Scan`, so this is `true` for them
+    /// (ordering is handled inside `QuerySql`). DynamoDB's `Scan` API returns
+    /// items in an arbitrary order with no server-side sort, so this is `false`
+    /// for DynamoDB. When `false`, the planner rejects queries that combine a
+    /// scan path with `ORDER BY`.
+    pub scan_supports_sort: bool,
+
     /// Whether to test connection pool behavior.
     /// TODO: We only need this for the `connection_per_clone.rs` test, come up with a better way.
     pub test_connection_pool: bool,
+
+    /// Whether the driver supports backward (previous-page) pagination.
+    /// SQL: true. DynamoDB: false.
+    pub backward_pagination: bool,
+
+    /// The driver's bind layer accepts a single parameter whose value is
+    /// `Value::List(items)` and type is `Type::List(elem)`, sending it as
+    /// one protocol-level parameter (not N separate scalars).
+    /// Property of the driver bind impl, not the SQL dialect.
+    pub bind_list_param: bool,
+
+    /// The SQL dialect parses `expr <op> ANY(<array>)` and `expr <op> ALL(<array>)`
+    /// as predicates against an array-valued operand.
+    /// Property of the dialect, not the bind layer.
+    pub predicate_match_any: bool,
 }
 
 /// Maps application-level types to the concrete database column types used for
@@ -295,7 +342,21 @@ impl Capability {
 
         index_or_predicate: true,
 
+        native_starts_with: false,
+        native_like: true,
+
+        // SQL drivers handle unindexed queries via QuerySql (see field doc).
+        scan: true,
+        scan_supports_sort: true,
+
         test_connection_pool: false,
+
+        backward_pagination: true,
+
+        // SQLite: list params are not bound as a single protocol parameter; the
+        // engine still emits expanded `IN (?, ?, ?)` lists.
+        bind_list_param: false,
+        predicate_match_any: false,
     };
 
     /// PostgreSQL capabilities
@@ -306,6 +367,9 @@ impl Capability {
         select_for_update: true,
         auto_increment: true,
         bigdecimal_implemented: false,
+
+        // PostgreSQL has the `^@` prefix-match operator.
+        native_starts_with: true,
 
         // PostgreSQL has CREATE TYPE ... AS ENUM
         native_enum: true,
@@ -322,6 +386,11 @@ impl Capability {
         decimal_arbitrary_precision: true,
 
         test_connection_pool: true,
+
+        // PostgreSQL accepts a single array-valued bind param and supports
+        // `expr <op> ANY(array)` / `<op> ALL(array)` predicates.
+        bind_list_param: true,
+        predicate_match_any: true,
 
         ..Self::SQLITE
     };
@@ -382,7 +451,21 @@ impl Capability {
 
         index_or_predicate: false,
 
+        // DynamoDB has `begins_with()` but no LIKE.
+        native_starts_with: true,
+        native_like: false,
+
+        scan: true,
+        scan_supports_sort: false,
+
         test_connection_pool: false,
+
+        backward_pagination: false,
+
+        // DynamoDB: not SQL-based; the array-bind/`ANY`-predicate features do
+        // not apply.
+        bind_list_param: false,
+        predicate_match_any: false,
     };
 }
 

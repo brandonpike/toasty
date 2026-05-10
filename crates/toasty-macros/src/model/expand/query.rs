@@ -53,6 +53,17 @@ impl Expand<'_> {
                     self.stmt.count()
                 }
 
+                #vis fn select<__E, __T>(
+                    self,
+                    projection: __E,
+                ) -> #toasty::stmt::Query<#toasty::List<__T>>
+                where
+                    __E: #toasty::IntoExpr<__T>,
+                    __T: #toasty::Load,
+                {
+                    self.stmt.select(projection)
+                }
+
                 #vis fn delete(self) -> #toasty::stmt::Delete<()> {
                     self.stmt.delete()
                 }
@@ -69,6 +80,14 @@ impl Expand<'_> {
 
                 #vis fn order_by(mut self, order_by: impl Into<#toasty::stmt::OrderBy>) -> #query_struct_ident {
                     self.stmt.order_by(order_by);
+                    self
+                }
+
+                #vis fn latest_by<#include_ty>(
+                    mut self,
+                    field: #toasty::stmt::Path<#model_ident, #include_ty>
+                ) -> #query_struct_ident {
+                    self.stmt.latest_by(field);
                     self
                 }
 
@@ -188,15 +207,15 @@ impl Expand<'_> {
         let model_ident = &self.model.ident;
         let query_struct_ident = &self.model.kind.as_root_unwrap().query_struct_ident;
 
-        if self.model.has_associations() {
-            Some(quote! {
-                    #vis fn include<#include_ty>(mut self, path: impl #toasty::Into<#toasty::Path<#model_ident, #include_ty>>) -> #query_struct_ident {
-                        self.stmt.include(path.into());
-                        self
-                    }
-            })
-        } else {
-            None
-        }
+        // Always emit `include()` on root models. The macro can't see through a
+        // field's type to know whether an embedded type holds a `#[deferred]`
+        // sub-field, so a stricter gate would deny `.include(metadata().notes())`
+        // on a model whose only includable thing lives inside an embed.
+        Some(quote! {
+                #vis fn include<#include_ty>(mut self, path: impl #toasty::Into<#toasty::Path<#model_ident, #include_ty>>) -> #query_struct_ident {
+                    self.stmt.include(path.into());
+                    self
+                }
+        })
     }
 }

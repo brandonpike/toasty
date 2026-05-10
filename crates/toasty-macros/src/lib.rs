@@ -78,12 +78,12 @@ use proc_macro::TokenStream;
 /// DynamoDB); `local` fields scope within a partition. For SQL databases
 /// both behave as a regular composite primary key.
 ///
-/// Multiple `partition` and `local` entries are allowed:
+/// Multiple `partition` and `local` fields are allowed using bracket syntax:
 ///
 /// ```
 /// # use toasty::Model;
 /// # #[derive(Model)]
-/// #[key(partition = tenant, partition = org, local = id)]
+/// #[key(partition = [tenant, org], local = [id])]
 /// # struct Example { tenant: String, org: String, id: String }
 /// ```
 ///
@@ -579,7 +579,7 @@ use proc_macro::TokenStream;
     Model,
     attributes(
         key, auto, default, update, column, index, unique, table, has_many, has_one, belongs_to,
-        serialize
+        serialize, version, deferred
     )
 )]
 pub fn derive_model(input: TokenStream) -> TokenStream {
@@ -715,6 +715,29 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 /// - For data-carrying variants, per-variant handle types with a
 ///   `matches(closure)` method for pattern matching and field access.
 ///
+/// # Newtype `Auto` proxying
+///
+/// A tuple-newtype embedded struct (one unnamed field) automatically
+/// implements `Auto` whenever its inner type does — no annotation
+/// required. Toasty emits a `NewtypeOf` marker carrying the inner type
+/// and a blanket `Auto` impl resolves through it:
+///
+/// ```
+/// #[derive(toasty::Embed)]
+/// struct UserId(uuid::Uuid);
+///
+/// #[derive(toasty::Model)]
+/// struct User {
+///     #[key]
+///     #[auto]
+///     id: UserId,
+///     name: String,
+/// }
+/// ```
+///
+/// Newtypes wrapping non-`Auto` types stay non-`Auto`; nesting works
+/// transparently (`Outer(Inner(u64))` proxies through both layers).
+///
 /// # Field-level attributes
 ///
 /// ## `#[column(...)]` — customize the database column
@@ -778,8 +801,8 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 ///
 /// Reference an embedded type as a field on a [`Model`][`derive@Model`]
 /// struct. The parent model's create and update builders gain a setter for
-/// the embedded field. For embedded structs, a `with_<field>` method
-/// supports partial updates of individual sub-fields:
+/// the embedded field. Partial updates of individual sub-fields use
+/// `stmt::patch`:
 ///
 /// ```no_run
 /// # #[derive(toasty::Embed)]
@@ -793,14 +816,16 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 /// #     address: Address,
 /// # }
 /// # async fn example(mut db: toasty::Db, mut user: User) -> toasty::Result<()> {
+/// use toasty::stmt;
+///
 /// // Full replacement
 /// user.update()
 ///     .address(Address { street: "456 Oak Ave".into(), city: "Seattle".into() })
 ///     .exec(&mut db).await?;
 ///
-/// // Partial update (struct only) — updates city, leaves street unchanged
+/// // Partial update — updates city, leaves street unchanged
 /// user.update()
-///     .with_address(|a| { a.city("Portland"); })
+///     .address(stmt::patch(Address::fields().city(), "Portland"))
 ///     .exec(&mut db).await?;
 /// # Ok(())
 /// # }
@@ -891,8 +916,12 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 /// ).exec(&mut db).await?;
 ///
 /// // Partial update
+/// use toasty::stmt;
 /// doc.update()
-///     .with_meta(|m| { m.version(2).status("published"); })
+///     .meta(stmt::apply([
+///         stmt::patch(Metadata::fields().version(), 2),
+///         stmt::patch(Metadata::fields().status(), "published"),
+///     ]))
 ///     .exec(&mut db).await?;
 /// # Ok(())
 /// # }
@@ -900,7 +929,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 ///
 /// [`Embed`]: toasty::Embed
 /// [`Register`]: toasty::Register
-#[proc_macro_derive(Embed, attributes(column, index, unique))]
+#[proc_macro_derive(Embed, attributes(column, deferred, index, unique))]
 pub fn derive_embed(input: TokenStream) -> TokenStream {
     match model::generate_embed(input.into()) {
         Ok(output) => output.into(),

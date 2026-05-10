@@ -11,7 +11,7 @@ mod util;
 
 use filters::Filter;
 
-use super::schema::Model;
+use super::schema::{FieldTy, Model, ModelKind};
 
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
@@ -36,6 +36,9 @@ impl Expand<'_> {
         let create_builder = self.expand_create_builder();
         let update_builder = self.expand_update_builder();
         let relation_structs = self.expand_relation_structs();
+        let validate_create_impls = self.expand_validate_create_impls();
+        let storage_compat_checks = self.expand_storage_compat_checks();
+        let auto_compat_checks = self.expand_auto_compat_checks();
 
         wrap_in_const(quote! {
             #model_impls
@@ -45,6 +48,9 @@ impl Expand<'_> {
             #create_builder
             #update_builder
             #relation_structs
+            #validate_create_impls
+            #storage_compat_checks
+            #auto_compat_checks
         })
     }
 }
@@ -84,15 +90,21 @@ pub(super) fn embedded_model(model: &Model) -> TokenStream {
     let embedded_field_list_struct = expand.expand_field_list_struct();
     let embedded_model_impls = expand.expand_embedded_model_impls();
     let embedded_update_builder = expand.expand_embedded_update_builder();
+    let storage_compat_checks = expand.expand_storage_compat_checks();
+    let newtype_marker = expand.expand_embedded_newtype_marker();
     let field_list_struct_ident = &embedded.field_list_struct_ident;
 
     wrap_in_const(quote! {
+        #newtype_marker
+
         #embedded_field_struct
         #embedded_field_list_struct
 
         #embedded_update_builder
 
         #embedded_model_impls
+
+        #storage_compat_checks
 
         impl #toasty::Register for #model_ident {
             fn id() -> #toasty::core::schema::app::ModelId {
@@ -232,10 +244,13 @@ pub(super) fn embedded_enum(model: &Model) -> TokenStream {
     let enum_field_struct = e.expand_enum_field_struct();
     let enum_field_list_struct = e.expand_field_list_struct();
     let field_register_calls = e.expand_field_register_calls();
+    let storage_compat_checks = e.expand_storage_compat_checks();
 
     wrap_in_const(quote! {
         #enum_field_struct
         #enum_field_list_struct
+
+        #storage_compat_checks
 
         impl #toasty::Register for #model_ident {
             fn id() -> #toasty::core::schema::app::ModelId {
@@ -347,29 +362,34 @@ pub(super) fn embedded_enum(model: &Model) -> TokenStream {
 // === Shared token-generation helpers ===
 
 impl Expand<'_> {
-    /// Generates a block that converts a Rust value into an untyped `core::stmt::Expr`
-    /// via the typed `IntoExpr` trait.
-    ///
-    /// Produced token pattern:
-    /// ```ignore
-    /// {
-    ///     let expr: Expr<T> = IntoExpr::into_expr(value);
-    ///     let untyped: core::stmt::Expr = expr.into();
-    ///     untyped
-    /// }
-    /// ```
-    fn expand_into_untyped_expr(
-        &self,
-        ty: impl quote::ToTokens,
-        value: impl quote::ToTokens,
-    ) -> TokenStream {
+    /// For tuple-newtype `#[derive(Embed)]` types (one unnamed field), emit
+    /// the `NewtypeOf` marker carrying the inner field's type. The blanket
+    /// `impl<T: NewtypeOf, T::Inner: Auto> Auto for T` in `codegen_support`
+    /// then promotes the newtype to `Auto` whenever the inner type is auto,
+    /// without errors when the inner type is not auto.
+    fn expand_embedded_newtype_marker(&self) -> TokenStream {
+        let ModelKind::EmbeddedStruct(embedded) = &self.model.kind else {
+            return quote! {};
+        };
+        // Only canonical newtypes (single unnamed field) qualify. Named
+        // single-field structs are explicit wrappers and stay opaque.
+        if embedded.fields_named || self.model.fields.len() != 1 {
+            return quote! {};
+        }
+
+        let inner = &self.model.fields[0];
+        let FieldTy::Primitive(inner_ty) = &inner.ty else {
+            // Relations are not allowed inside an `Embed` body today; nothing
+            // to mark if that ever changes.
+            return quote! {};
+        };
+
         let toasty = &self.toasty;
+        let model_ident = &self.model.ident;
+
         quote! {
-            {
-                let expr: #toasty::stmt::Expr<#ty> =
-                    #toasty::stmt::IntoExpr::into_expr(#value);
-                let untyped: #toasty::core::stmt::Expr = expr.into();
-                untyped
+            impl #toasty::newtype::NewtypeOf for #model_ident {
+                type Inner = #inner_ty;
             }
         }
     }

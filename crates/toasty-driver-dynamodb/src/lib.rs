@@ -32,6 +32,7 @@ use toasty_core::{
 use aws_sdk_dynamodb::{
     Client,
     error::SdkError,
+    operation::transact_write_items::TransactWriteItemsError,
     operation::update_item::UpdateItemError,
     types::{
         AttributeDefinition, AttributeValue, BillingMode, Delete, GlobalSecondaryIndex,
@@ -193,6 +194,7 @@ impl Connection {
                     _ => todo!("op={:#?}", op.stmt),
                 }
             }
+            Operation::Scan(op) => self.exec_scan(schema, op).await,
             Operation::Transaction(_) => Err(Error::unsupported_feature(
                 "transactions are not supported by the DynamoDB driver",
             )),
@@ -340,7 +342,16 @@ fn ddb_expression(
         }
         stmt::Expr::Reference(expr_reference) => {
             let column = cx.resolve_expr_reference(expr_reference).as_column_unwrap();
-            attrs.column(column).to_string()
+            let is_bool = column.ty.is_bool();
+            let col_alias = attrs.column(column).to_string();
+            // A bare boolean column reference used as a predicate (result of
+            // `field = true` simplification) needs an explicit equality check.
+            if is_bool {
+                let true_val = attrs.ddb_value(aws_sdk_dynamodb::types::AttributeValue::Bool(true));
+                format!("{col_alias} = {true_val}")
+            } else {
+                col_alias
+            }
         }
         stmt::Expr::Value(val) => attrs.value(val),
         stmt::Expr::And(expr_and) => {
@@ -357,7 +368,7 @@ fn ddb_expression(
                 .iter()
                 .map(|operand| ddb_expression(cx, attrs, primary, operand))
                 .collect::<Vec<_>>();
-            operands.join(" OR ")
+            format!("({})", operands.join(" OR "))
         }
         stmt::Expr::InList(in_list) => {
             let expr = ddb_expression(cx, attrs, primary, &in_list.expr);
@@ -384,6 +395,16 @@ fn ddb_expression(
         stmt::Expr::Not(expr_not) => {
             let inner = ddb_expression(cx, attrs, primary, &expr_not.expr);
             format!("(NOT {inner})")
+        }
+        stmt::Expr::StartsWith(expr_starts_with) => {
+            let expr = ddb_expression(cx, attrs, primary, &expr_starts_with.expr);
+            let prefix = ddb_expression(cx, attrs, primary, &expr_starts_with.prefix);
+            format!("begins_with({expr}, {prefix})")
+        }
+        stmt::Expr::Like(_) => {
+            panic!(
+                "LIKE is not supported by the DynamoDB driver; use starts_with for prefix matching"
+            )
         }
         _ => todo!("FILTER = {:#?}", expr),
     }

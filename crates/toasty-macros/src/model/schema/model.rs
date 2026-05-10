@@ -15,6 +15,13 @@ pub(crate) enum ModelKind {
 }
 
 impl ModelKind {
+    pub(crate) fn as_root(&self) -> Option<&ModelRoot> {
+        match self {
+            ModelKind::Root(root) => Some(root),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_root_unwrap(&self) -> &ModelRoot {
         match self {
             ModelKind::Root(root) => root,
@@ -44,6 +51,9 @@ impl ModelKind {
 pub(crate) struct ModelRoot {
     /// Tracks fields in the primary key
     pub(crate) primary_key: PrimaryKey,
+
+    /// Index of the versionable field, if any
+    pub(crate) version_field: Option<usize>,
 
     /// The field struct identifier (e.g., `UserFields`)
     pub(crate) field_struct_ident: syn::Ident,
@@ -244,10 +254,34 @@ impl Model {
                 fields: pk_index_fields,
                 unique: true,
                 primary_key: true,
+                name: model_attr.key.as_ref().and_then(|k| k.name.clone()),
             });
+
+            // Iterate all extras rather than bailing on the first so every
+            // offending site surfaces in one compile pass.
+            let mut version_iter = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.attrs.versionable);
+            let version_field = version_iter.next().map(|(i, _)| i);
+            let mut extra_err: Option<syn::Error> = None;
+            for (_, extra) in version_iter {
+                let err = syn::Error::new_spanned(
+                    &extra.name.ident,
+                    "only one field may be annotated with #[version]",
+                );
+                match &mut extra_err {
+                    Some(acc) => acc.combine(err),
+                    None => extra_err = Some(err),
+                }
+            }
+            if let Some(err) = extra_err {
+                return Err(err);
+            }
 
             ModelKind::Root(ModelRoot {
                 primary_key: PrimaryKey { fields: pk_fields },
+                version_field,
                 field_struct_ident: struct_ident("Fields", ast),
                 field_list_struct_ident: struct_list_ident("ListFields", ast),
                 query_struct_ident: struct_ident("Query", ast),
@@ -301,6 +335,7 @@ impl Model {
                 fields: index_fields,
                 unique: false,
                 primary_key: false,
+                name: index_attr.name.clone(),
             });
         }
 
@@ -328,10 +363,6 @@ impl Model {
             ),
             ModelKind::EmbeddedStruct(_) | ModelKind::EmbeddedEnum(_) => None,
         }
-    }
-
-    pub(crate) fn has_associations(&self) -> bool {
-        self.fields.iter().any(|f| f.ty.is_relation())
     }
 
     pub(crate) fn from_enum_ast(ast: &syn::ItemEnum) -> syn::Result<Self> {
@@ -398,6 +429,12 @@ impl Model {
             for (index, ast_field) in ast_fields.iter().enumerate() {
                 let mut field =
                     Field::from_ast(ast_field, &model_ident, global_field_index, index, &names)?;
+                if field.attrs.deferred {
+                    errs.push(syn::Error::new_spanned(
+                        ast_field,
+                        "#[deferred] is not yet supported on embedded enum variant fields",
+                    ));
+                }
                 field.variant = Some(variant_index);
                 all_fields.push(field);
                 global_field_index += 1;
@@ -540,6 +577,7 @@ fn collect_field_indices(fields: &[Field], indices: &mut Vec<Index>) {
                 }],
                 unique: field.attrs.unique,
                 primary_key: false,
+                name: None,
             });
         }
     }

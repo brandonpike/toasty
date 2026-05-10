@@ -63,11 +63,17 @@ mod eval;
 mod expr;
 pub use expr::Expr;
 
+mod expr_all_op;
+pub use expr_all_op::ExprAllOp;
+
 mod expr_and;
 pub use expr_and::ExprAnd;
 
 mod expr_any;
 pub use expr_any::ExprAny;
+
+mod expr_any_op;
+pub use expr_any_op::ExprAnyOp;
 
 mod expr_arg;
 pub use expr_arg::ExprArg;
@@ -102,6 +108,9 @@ pub use expr_is_variant::ExprIsVariant;
 mod expr_let;
 pub use expr_let::ExprLet;
 
+mod expr_like;
+pub use expr_like::ExprLike;
+
 mod expr_list;
 pub use expr_list::ExprList;
 
@@ -131,6 +140,9 @@ pub use expr_set::ExprSet;
 
 mod expr_set_op;
 pub use expr_set_op::ExprSetOp;
+
+mod expr_starts_with;
+pub use expr_starts_with::ExprStartsWith;
 
 mod expr_stmt;
 pub use expr_stmt::ExprStmt;
